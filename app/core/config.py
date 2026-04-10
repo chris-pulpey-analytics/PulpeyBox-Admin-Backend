@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     JWT_EXPIRE_HOURS: int = 8
 
     ADMIN_ROLE_NAME: str = "Admin"
+    USER_ROLE_NAME: str = "User"
 
     class Config:
         env_file = ".env"

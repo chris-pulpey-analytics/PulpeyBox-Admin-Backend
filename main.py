@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, users, surveys, news, settings_api, locations, contact, metrics, map_api
+from app.api import auth, users, surveys, news, settings_api, locations, contact, metrics, map_api, admin_users, reports
 
 app = FastAPI(title="PulpeyBox Admin API", version="1.0.0", docs_url="/api/docs")
 
@@ -21,6 +21,8 @@ app.include_router(locations.router, prefix="/api")
 app.include_router(contact.router, prefix="/api")
 app.include_router(metrics.router, prefix="/api")
 app.include_router(map_api.router, prefix="/api")
+app.include_router(admin_users.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
 
 
 @app.get("/api/health")

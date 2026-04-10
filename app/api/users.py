@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import date
+from pydantic import BaseModel
 from app.api.auth import get_current_admin
 from app.core.database import get_db
 from app.schemas.user import UserFilters
@@ -259,8 +260,8 @@ def get_users(
 
     count_sql = f'SELECT COUNT(DISTINCT u."Id") {BASE_FROM} {where}'
     data_sql = (
-        f"SELECT * FROM (SELECT DISTINCT ON (u.\"Id\") {BASE_SELECT} {BASE_FROM} {where} {BASE_GROUP}) sub "
-        f"ORDER BY sub.\"Id\" DESC LIMIT %s OFFSET %s"
+        f"{BASE_SELECT} {BASE_FROM} {where} {BASE_GROUP} "
+        f"ORDER BY u.\"Id\" DESC LIMIT %s OFFSET %s"
     )
 
     with get_db() as conn:
@@ -286,7 +287,7 @@ def export_users(
     _: dict = Depends(get_current_admin),
 ):
     where, params = build_where(filters)
-    sql = f"SELECT {BASE_SELECT} {BASE_FROM} {where} {BASE_GROUP} ORDER BY u.\"Id\" DESC"
+    sql = f"{BASE_SELECT} {BASE_FROM} {where} {BASE_GROUP} ORDER BY u.\"Id\" DESC"
 
     with get_db() as conn:
         cur = conn.cursor()
@@ -318,7 +319,7 @@ def export_users(
 
 @router.get("/{user_id}")
 def get_user(user_id: int, _: dict = Depends(get_current_admin)):
-    sql = f"SELECT {BASE_SELECT} {BASE_FROM} WHERE u.\"Id\" = %s {BASE_GROUP}"
+    sql = f"{BASE_SELECT} {BASE_FROM} WHERE u.\"Id\" = %s {BASE_GROUP}"
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(sql, (user_id,))
@@ -352,3 +353,103 @@ def get_user(user_id: int, _: dict = Depends(get_current_admin)):
         news = [dict(r) for r in cur.fetchall()]
 
     return {"user": dict(user), "surveys": surveys, "news": news}
+
+
+class UserUpdate(BaseModel):
+    # Users table
+    name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    mobil_number: Optional[str] = None
+    # UserProfiles table
+    birth_date: Optional[date] = None
+    gender_id: Optional[int] = None
+    marital_status_id: Optional[int] = None
+    role_house_id: Optional[int] = None
+    income_range_id: Optional[int] = None
+    professions_id: Optional[int] = None
+    number_children_id: Optional[int] = None
+    level_academic_id: Optional[int] = None
+    frequency_activities_id: Optional[int] = None
+    instagram: Optional[str] = None
+    is_buy_manager_home: Optional[bool] = None
+    is_pregnant: Optional[bool] = None
+    is_interested_technology: Optional[bool] = None
+    is_alcohol_consume: Optional[bool] = None
+    is_tobacco_consume: Optional[bool] = None
+    address: Optional[str] = None
+    exact_address: Optional[str] = None
+    instruction: Optional[str] = None
+    zone: Optional[int] = None
+    city_id: Optional[int] = None
+    pets_id: Optional[str] = None
+    hobbies_id: Optional[str] = None
+
+
+@router.patch("/{user_id}")
+def update_user(user_id: int, data: UserUpdate, _: dict = Depends(get_current_admin)):
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # Update Users table
+        user_updates = []
+        user_params = []
+        if data.name is not None:
+            user_updates.append('"Name"=%s')
+            user_params.append(data.name)
+        if data.last_name is not None:
+            user_updates.append('"LastName"=%s')
+            user_params.append(data.last_name)
+        if data.email is not None:
+            user_updates.append('"Email"=%s')
+            user_params.append(data.email)
+        if data.mobil_number is not None:
+            user_updates.append('"MobilNumber"=%s')
+            user_params.append(data.mobil_number)
+        if user_updates:
+            user_params.append(user_id)
+            cur.execute(f'UPDATE public."Users" SET {",".join(user_updates)} WHERE "Id"=%s', user_params)
+
+        # Update UserProfiles table
+        profile_updates = []
+        profile_params = []
+        mapping = [
+            ("birth_date", '"BirthDate"'),
+            ("gender_id", '"GenderId"'),
+            ("marital_status_id", '"MaritalStatusId"'),
+            ("role_house_id", '"RoleHouseId"'),
+            ("income_range_id", '"IncomeRangeId"'),
+            ("professions_id", '"ProfessionsId"'),
+            ("number_children_id", '"NumberChildrenId"'),
+            ("level_academic_id", '"LevelAcademicId"'),
+            ("frequency_activities_id", '"FrequencyActivitiesPhysicalId"'),
+            ("instagram", '"Instagram"'),
+            ("is_buy_manager_home", '"IsBuyManagerHome"'),
+            ("is_pregnant", '"IsPregnant"'),
+            ("is_interested_technology", '"IsInterestedTechnology"'),
+            ("is_alcohol_consume", '"IsAlcoholConsume"'),
+            ("is_tobacco_consume", '"IsTobaccoConsume"'),
+            ("address", '"Address"'),
+            ("exact_address", '"ExactAddress"'),
+            ("instruction", '"Instruction"'),
+            ("zone", '"Zone"'),
+            ("city_id", '"CityId"'),
+            ("pets_id", '"PetsId"'),
+            ("hobbies_id", '"HobbiesId"'),
+        ]
+        for field, col in mapping:
+            val = getattr(data, field)
+            if val is not None:
+                profile_updates.append(f"{col}=%s")
+                profile_params.append(val)
+
+        if profile_updates:
+            profile_params.append(user_id)
+            cur.execute(
+                f'UPDATE public."UserProfiles" SET {",".join(profile_updates)}, "LastUserProfileDate"=NOW() WHERE "UserId"=%s',
+                profile_params,
+            )
+
+        conn.commit()
+
+    return {"message": "Usuario actualizado"}

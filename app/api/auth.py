@@ -36,8 +36,8 @@ def login(data: LoginRequest):
     if not verify_password(data.password, user["PasswordHash"], user["PasswordSalt"]):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
-    if user["RolName"].lower() != settings.ADMIN_ROLE_NAME.lower():
-        raise HTTPException(status_code=403, detail="Acceso restringido a administradores")
+    if user["RolName"].lower() == settings.USER_ROLE_NAME.lower():
+        raise HTTPException(status_code=403, detail="Acceso restringido al panel de administración")
 
     token = create_access_token(
         {"sub": str(user["Id"]), "email": user["Email"], "role": user["RolName"]}
@@ -55,6 +55,13 @@ def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(bearer
     payload = decode_token(credentials.credentials)
     if not payload:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
-    if payload.get("role", "").lower() != settings.ADMIN_ROLE_NAME.lower():
+    if payload.get("role", "").lower() == settings.USER_ROLE_NAME.lower():
         raise HTTPException(status_code=403, detail="Acceso denegado")
+    return payload
+
+
+def require_admin(payload: dict = Depends(get_current_admin)):
+    """Solo el rol Admin puede ejecutar esta acción."""
+    if payload.get("role", "").lower() != settings.ADMIN_ROLE_NAME.lower():
+        raise HTTPException(status_code=403, detail="Solo administradores pueden realizar esta acción")
     return payload

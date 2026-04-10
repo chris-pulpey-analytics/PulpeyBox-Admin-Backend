@@ -1,3 +1,4 @@
+import os
 import hmac
 import hashlib
 from datetime import datetime, timedelta
@@ -13,6 +14,13 @@ def verify_password(plain_password: str, stored_hash: bytes, stored_salt: bytes)
     h = hmac.new(bytes(stored_salt), plain_password.encode("utf-8"), hashlib.sha512)
     computed = h.digest()
     return hmac.compare_digest(computed, bytes(stored_hash))
+
+
+def create_password(plain_password: str) -> tuple:
+    """Crea HMACSHA512 hash + salt para una nueva contraseña, compatible con C#."""
+    salt = os.urandom(64)
+    h = hmac.new(salt, plain_password.encode("utf-8"), hashlib.sha512)
+    return h.digest(), salt
 
 
 def create_access_token(data: dict) -> str:
