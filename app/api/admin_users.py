@@ -11,6 +11,7 @@ router = APIRouter(prefix="/admin-users", tags=["admin-users"])
 
 class RoleCreate(BaseModel):
     rol_name: str
+    description: Optional[str] = ""
 
 
 # ─── Roles CRUD ──────────────────────────────────────────────────────────────
@@ -20,8 +21,8 @@ def create_role(data: RoleCreate, _: dict = Depends(require_admin)):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            'INSERT INTO public."Roles" ("RolName") VALUES (%s) RETURNING "Id"',
-            (data.rol_name,),
+            'INSERT INTO public."Roles" ("RolName", "Description", "CreationDate", "Deleted") VALUES (%s, %s, NOW(), FALSE) RETURNING "Id"',
+            (data.rol_name, data.description or ""),
         )
         new_id = cur.fetchone()["Id"]
         conn.commit()
@@ -41,7 +42,10 @@ def update_role(role_id: int, data: RoleCreate, _: dict = Depends(require_admin)
             raise HTTPException(404, "Rol no encontrado")
         if row["RolName"].lower() == settings.USER_ROLE_NAME.lower():
             raise HTTPException(400, "No se puede modificar el rol de usuario básico")
-        cur.execute('UPDATE public."Roles" SET "RolName"=%s WHERE "Id"=%s', (data.rol_name, role_id))
+        cur.execute(
+            'UPDATE public."Roles" SET "RolName"=%s, "Description"=%s WHERE "Id"=%s',
+            (data.rol_name, data.description or "", role_id),
+        )
         conn.commit()
     return {"message": "Rol actualizado"}
 
@@ -70,6 +74,8 @@ class AdminUserCreate(BaseModel):
     email: str
     password: str
     role_id: int
+    mobil_number: str = ""
+    mobil_number_code_id: Optional[int] = None  # si None, se busca el primer código disponible
 
 
 class AdminUserUpdate(BaseModel):
@@ -77,6 +83,7 @@ class AdminUserUpdate(BaseModel):
     last_name: Optional[str] = None
     email: Optional[str] = None
     role_id: Optional[int] = None
+    mobil_number: Optional[str] = None
 
 
 class PasswordReset(BaseModel):
@@ -89,7 +96,7 @@ def get_roles(_: dict = Depends(get_current_admin)):
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            'SELECT "Id", "RolName" FROM public."Roles" WHERE LOWER("RolName") != LOWER(%s) ORDER BY "Id"',
+            'SELECT "Id", "RolName", COALESCE("Description", \'\') AS "Description" FROM public."Roles" WHERE LOWER("RolName") != LOWER(%s) ORDER BY "Id"',
             (settings.USER_ROLE_NAME,),
         )
         return [dict(r) for r in cur.fetchall()]
@@ -129,15 +136,24 @@ def create_admin_user(data: AdminUserCreate, _: dict = Depends(require_admin)):
         if cur.fetchone():
             raise HTTPException(400, "El email ya está registrado")
 
+        # Resolver MobilNumberCodeId: usar el proporcionado o el primero disponible en Settings
+        code_id = data.mobil_number_code_id
+        if not code_id:
+            cur.execute('SELECT "Id" FROM public."Settings" ORDER BY "Id" LIMIT 1')
+            row = cur.fetchone()
+            code_id = row["Id"] if row else 1
+
         cur.execute(
             """
             INSERT INTO public."Users"
                 ("Name","LastName","Email","PasswordHash","PasswordSalt","RoleId",
+                 "MobilNumber","MobilNumberCodeId","Status",
                  "IsAccountValidated","Deleted","CreationDate")
-            VALUES (%s,%s,%s,%s,%s,%s,TRUE,FALSE,NOW())
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,TRUE,FALSE,NOW())
             RETURNING "Id"
             """,
-            (data.name, data.last_name, data.email, pwd_hash, pwd_salt, data.role_id),
+            (data.name, data.last_name, data.email, pwd_hash, pwd_salt, data.role_id,
+             data.mobil_number or "", code_id),
         )
         new_id = cur.fetchone()["Id"]
         conn.commit()
@@ -163,6 +179,9 @@ def update_admin_user(user_id: int, data: AdminUserUpdate, _: dict = Depends(req
         if data.role_id is not None:
             updates.append('"RoleId"=%s')
             params.append(data.role_id)
+        if data.mobil_number is not None:
+            updates.append('"MobilNumber"=%s')
+            params.append(data.mobil_number)
         if updates:
             params.append(user_id)
             cur.execute(

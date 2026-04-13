@@ -1,6 +1,6 @@
 import io
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import date
@@ -114,6 +114,21 @@ def export_surveys(
 
     df = pd.DataFrame(rows)
     return _export_response(df, "encuestas", format)
+
+
+@router.get("/assign-template")
+def download_assign_template(_: dict = Depends(get_current_admin)):
+    """Descarga plantilla Excel para asignar usuarios por ID a una encuesta."""
+    df = pd.DataFrame({"user_id": [123, 456, 789]})
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Usuarios")
+    out.seek(0)
+    return StreamingResponse(
+        iter([out.read()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=plantilla_asignar_usuarios.xlsx"},
+    )
 
 
 @router.get("/{survey_id}")
@@ -474,15 +489,28 @@ class AssignUsersRequest(BaseModel):
 
 @router.post("/{survey_id}/assign-users")
 def assign_users_to_survey(survey_id: int, body: AssignUsersRequest, _: dict = Depends(get_current_admin)):
-    """Asigna una lista de usuarios a la encuesta (omite duplicados)."""
+    """Asigna una lista de usuarios a la encuesta (omite duplicados, reporta errores)."""
     if not body.user_ids:
-        return {"assigned": 0, "skipped": 0}
+        return {"assigned": 0, "skipped": 0, "errors": []}
 
     assigned = 0
     skipped = 0
+    errors = []
     with get_db() as conn:
         cur = conn.cursor()
         for uid in body.user_ids:
+            try:
+                uid = int(uid)
+            except (ValueError, TypeError):
+                errors.append({"user_id": str(uid), "reason": "ID inválido"})
+                continue
+            cur.execute(
+                'SELECT "Id" FROM public."Users" WHERE "Id"=%s AND "Deleted" IS DISTINCT FROM TRUE',
+                (uid,),
+            )
+            if not cur.fetchone():
+                errors.append({"user_id": uid, "reason": "Usuario no encontrado"})
+                continue
             cur.execute(
                 'SELECT "Id" FROM public."UserSurveys" WHERE "UserId"=%s AND "SurveyId"=%s',
                 (uid, survey_id),
@@ -498,7 +526,62 @@ def assign_users_to_survey(survey_id: int, body: AssignUsersRequest, _: dict = D
             assigned += 1
         conn.commit()
 
-    return {"assigned": assigned, "skipped": skipped}
+    return {"assigned": assigned, "skipped": skipped, "errors": errors}
+
+
+@router.post("/{survey_id}/assign-users-excel")
+async def assign_users_excel_survey(
+    survey_id: int,
+    file: UploadFile = File(...),
+    status_id: int = Form(146),
+    _: dict = Depends(get_current_admin),
+):
+    """Asigna usuarios a la encuesta desde un Excel con columna 'user_id'."""
+    contents = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(contents))
+    except Exception:
+        raise HTTPException(400, "Archivo inválido. Sube un .xlsx o .xls válido")
+
+    col = next((c for c in df.columns if c.strip().lower() == "user_id"), None)
+    if col is None:
+        raise HTTPException(400, "El archivo debe tener una columna llamada 'user_id'")
+
+    assigned = 0
+    skipped = 0
+    errors = []
+    with get_db() as conn:
+        cur = conn.cursor()
+        for i, row in df.iterrows():
+            row_num = int(i) + 2
+            raw = row[col]
+            try:
+                uid = int(raw)
+            except (ValueError, TypeError):
+                errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
+                continue
+            cur.execute(
+                'SELECT "Id" FROM public."Users" WHERE "Id"=%s AND "Deleted" IS DISTINCT FROM TRUE',
+                (uid,),
+            )
+            if not cur.fetchone():
+                errors.append({"row": row_num, "user_id": uid, "reason": "Usuario no encontrado"})
+                continue
+            cur.execute(
+                'SELECT "Id" FROM public."UserSurveys" WHERE "UserId"=%s AND "SurveyId"=%s',
+                (uid, survey_id),
+            )
+            if cur.fetchone():
+                skipped += 1
+                continue
+            cur.execute(
+                'INSERT INTO public."UserSurveys" ("UserId","SurveyId","AnswersJson","CreationDate","Deleted","StatusId","AnsweredDate") '
+                "VALUES (%s,%s,NULL,NOW() AT TIME ZONE 'UTC',FALSE,%s,NULL)",
+                (uid, survey_id, status_id),
+            )
+            assigned += 1
+        conn.commit()
+    return {"assigned": assigned, "skipped": skipped, "errors": errors}
 
 
 # ─── Preview users for survey assignment ─────────────────────────────────────

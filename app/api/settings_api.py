@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional
 from pydantic import BaseModel
 from app.api.auth import get_current_admin
@@ -104,30 +104,65 @@ def list_settings(group_id: Optional[int] = None, _: dict = Depends(get_current_
 
 
 @router.get("/grouped")
-def settings_grouped(_: dict = Depends(get_current_admin)):
-    """Retorna todos los settings agrupados por GroupSetting para el frontend."""
+def settings_grouped(
+    group_name: Optional[str] = Query(None, description="Filtrar por nombre del grupo exacto o parcial"),
+    group_id: Optional[int] = Query(None, description="Filtrar por ID del grupo"),
+    setting_id: Optional[int] = Query(None, description="Filtrar por ID del setting"),
+    _: dict = Depends(get_current_admin)
+):
+    """Retorna todos los settings agrupados por GroupSetting para el frontend, con filtros opcionales."""
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
+        
+        conditions = ['gs."Deleted" IS DISTINCT FROM TRUE']
+        params = []
+        
+        if group_name:
+            conditions.append('gs."Name" ILIKE %s')
+            params.append(f"%{group_name}%")
+        if group_id:
+            conditions.append('gs."Id" = %s')
+            params.append(group_id)
+            
+        setting_conditions = ['s."Deleted" IS DISTINCT FROM TRUE']
+        if setting_id:
+            setting_conditions.append('s."Id" = %s')
+            params.append(setting_id)
+            
+        where_gs = " AND ".join(conditions)
+        where_s = " AND ".join(setting_conditions)
+        
+        query = f"""
             SELECT gs."Id" AS group_id, gs."Name" AS group_name,
                    s."Id", s."Name", s."Code"
             FROM public."GroupSettings" gs
-            LEFT JOIN public."Settings" s ON s."SettingGroupId" = gs."Id"
-                AND s."Deleted" IS DISTINCT FROM TRUE
-            WHERE gs."Deleted" IS DISTINCT FROM TRUE
+            LEFT JOIN public."Settings" s ON s."SettingGroupId" = gs."Id" AND {where_s}
+            WHERE {where_gs}
             ORDER BY gs."Name", s."Name"
-            """
-        )
+        """
+        cur.execute(query, params)
         rows = cur.fetchall()
 
     grouped = {}
     for r in rows:
         gid = r["group_id"]
         if gid not in grouped:
-            grouped[gid] = {"id": gid, "name": r["group_name"], "settings": []}
+            grouped[gid] = {
+                "id": gid, 
+                "Id": gid,
+                "name": r["group_name"], 
+                "group_name": r["group_name"], 
+                "settings": []
+            }
         if r["Id"]:
-            grouped[gid]["settings"].append({"id": r["Id"], "name": r["Name"], "code": r["Code"]})
+            grouped[gid]["settings"].append({
+                "id": r["Id"],
+                "Id": r["Id"],
+                "name": r["Name"],
+                "Name": r["Name"],
+                "code": r["Code"],
+                "Code": r["Code"]
+            })
 
     return list(grouped.values())
 

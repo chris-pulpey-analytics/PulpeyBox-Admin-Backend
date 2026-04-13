@@ -1,6 +1,6 @@
 import io
 import pandas as pd
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import date
@@ -21,7 +21,7 @@ class NewsCreate(BaseModel):
     expiration_date: Optional[date] = None
     default: Optional[bool] = False
     link_types_id: Optional[int] = None
-    banners_types_id: Optional[int] = None
+    banners_types_id: int
 
 
 class NewsUpdate(NewsCreate):
@@ -79,6 +79,21 @@ def list_news(
         rows = [dict(r) for r in cur.fetchall()]
 
     return {"total": total, "page": page, "page_size": page_size, "data": rows}
+
+
+@router.get("/assign-template")
+def download_news_assign_template(_: dict = Depends(get_current_admin)):
+    """Descarga plantilla Excel para asignar usuarios por ID a una noticia/promoción."""
+    df = pd.DataFrame({"user_id": [123, 456, 789]})
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Usuarios")
+    out.seek(0)
+    return StreamingResponse(
+        iter([out.read()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=plantilla_asignar_usuarios.xlsx"},
+    )
 
 
 @router.get("/export")
@@ -202,6 +217,103 @@ def delete_news(news_id: int, _: dict = Depends(get_current_admin)):
         cur.execute('UPDATE public."NewsAndPromotions" SET "Deleted"=TRUE WHERE "Id"=%s', (news_id,))
         conn.commit()
     return {"message": "Eliminado"}
+
+
+class AssignNewsUsersRequest(BaseModel):
+    user_ids: list
+    status: int = 0
+
+
+def _assign_news_user(cur, uid: int, news_id: int, status: int) -> str:
+    """Inserta usuario en UserNewsAndPromotions. Devuelve 'ok', 'skip' o 'error'."""
+    cur.execute(
+        'SELECT "Id" FROM public."Users" WHERE "Id"=%s AND "Deleted" IS DISTINCT FROM TRUE',
+        (uid,),
+    )
+    if not cur.fetchone():
+        return "not_found"
+    cur.execute(
+        'SELECT "Id" FROM public."UserNewsAndPromotions" WHERE "UserId"=%s AND "NewsAndPromotionId"=%s',
+        (uid, news_id),
+    )
+    if cur.fetchone():
+        return "skip"
+    cur.execute(
+        'INSERT INTO public."UserNewsAndPromotions" ("UserId","NewsAndPromotionId","Status","ClickCount","CreationDate","Deleted") '
+        "VALUES (%s,%s,%s,0,NOW(),FALSE)",
+        (uid, news_id, status),
+    )
+    return "ok"
+
+
+@router.post("/{news_id}/assign-users")
+def assign_users_to_news(news_id: int, body: AssignNewsUsersRequest, _: dict = Depends(get_current_admin)):
+    """Asigna lista de usuarios a la noticia/promoción (omite duplicados, reporta errores)."""
+    if not body.user_ids:
+        return {"assigned": 0, "skipped": 0, "errors": []}
+
+    assigned = 0
+    skipped = 0
+    errors = []
+    with get_db() as conn:
+        cur = conn.cursor()
+        for uid in body.user_ids:
+            try:
+                uid = int(uid)
+            except (ValueError, TypeError):
+                errors.append({"user_id": str(uid), "reason": "ID inválido"})
+                continue
+            result = _assign_news_user(cur, uid, news_id, body.status)
+            if result == "ok":
+                assigned += 1
+            elif result == "skip":
+                skipped += 1
+            else:
+                errors.append({"user_id": uid, "reason": "Usuario no encontrado"})
+        conn.commit()
+    return {"assigned": assigned, "skipped": skipped, "errors": errors}
+
+
+@router.post("/{news_id}/assign-users-excel")
+async def assign_users_excel_news(
+    news_id: int,
+    file: UploadFile = File(...),
+    status: int = Form(0),
+    _: dict = Depends(get_current_admin),
+):
+    """Asigna usuarios a la noticia/promoción desde un Excel con columna 'user_id'."""
+    contents = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(contents))
+    except Exception:
+        raise HTTPException(400, "Archivo inválido. Sube un .xlsx o .xls válido")
+
+    col = next((c for c in df.columns if c.strip().lower() == "user_id"), None)
+    if col is None:
+        raise HTTPException(400, "El archivo debe tener una columna llamada 'user_id'")
+
+    assigned = 0
+    skipped = 0
+    errors = []
+    with get_db() as conn:
+        cur = conn.cursor()
+        for i, row in df.iterrows():
+            row_num = int(i) + 2
+            raw = row[col]
+            try:
+                uid = int(raw)
+            except (ValueError, TypeError):
+                errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
+                continue
+            result = _assign_news_user(cur, uid, news_id, status)
+            if result == "ok":
+                assigned += 1
+            elif result == "skip":
+                skipped += 1
+            else:
+                errors.append({"row": row_num, "user_id": uid, "reason": "Usuario no encontrado"})
+        conn.commit()
+    return {"assigned": assigned, "skipped": skipped, "errors": errors}
 
 
 def _export_response(df: pd.DataFrame, name: str, format: str):
