@@ -1,10 +1,15 @@
+# -*- coding: utf-8 -*-
 import io
+import json as _json
+import unicodedata
+import re
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-from typing import Optional
-from datetime import date
+from typing import Optional, List
+from datetime import date, datetime
 from pydantic import BaseModel
+from psycopg2.extras import execute_values
 from app.api.auth import get_current_admin
 from app.core.database import get_db
 
@@ -30,6 +35,20 @@ class SurveyUpdate(SurveyCreate):
 
 class LinkNewsRequest(BaseModel):
     news_id: int
+
+
+@router.get("/categories")
+def list_categories(_: dict = Depends(get_current_admin)):
+    """Retorna todas las categorías activas de la tabla Categories."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT "Id", "Name"
+               FROM public."Categories"
+               WHERE "Deleted" IS DISTINCT FROM TRUE
+               ORDER BY "Name" """
+        )
+        return [dict(r) for r in cur.fetchall()]
 
 
 @router.get("")
@@ -131,6 +150,342 @@ def download_assign_template(_: dict = Depends(get_current_admin)):
     )
 
 
+class InternalReportRequest(BaseModel):
+    survey_ids: List[int]
+    status_id: Optional[int] = None
+
+
+def _clean_sheet_name(name: str) -> str:
+    name = unicodedata.normalize("NFKD", str(name))
+    name = name.encode("ASCII", "ignore").decode("ASCII")
+    name = re.sub(r"[^\w\-_]", "_", name)
+    return name[:31]
+
+
+@router.post("/internal-report")
+def generate_internal_report(
+    data: InternalReportRequest,
+    _: dict = Depends(get_current_admin),
+):
+    """
+    Genera un reporte Excel multi-encuesta con el mismo formato que
+    Reporte_Surveys_Internos.py:
+    - Hoja 'Usuarios': datos de perfil de todos los usuarios únicos
+    - Hoja 'Survey_{id}_{nombre}': preguntas como columnas, respuestas como valores
+    - Hoja 'Surveys': info y estadísticas por encuesta
+    - Hoja 'Resumen': métricas generales
+    """
+    if not data.survey_ids:
+        raise HTTPException(400, "Debe especificar al menos un survey_id")
+
+    survey_ids = data.survey_ids
+    status_id = data.status_id
+    ids_tuple = tuple(survey_ids)
+
+    with get_db() as conn:
+        cur = conn.cursor()
+
+        # ── 1. Validar encuestas ─────────────────────────────────────────────
+        val_status_cond = 'AND us."StatusId" = %s' if status_id else ""
+        val_params: list = [ids_tuple]
+        if status_id:
+            val_params.append(status_id)
+        val_params.append(ids_tuple)
+
+        cur.execute(
+            f"""
+            WITH usp AS (
+                SELECT us."SurveyId",
+                    COUNT(DISTINCT us."UserId") AS usuarios_unicos,
+                    COUNT(us."Id")              AS participaciones
+                FROM public."UserSurveys" us
+                JOIN public."Surveys" s ON us."SurveyId" = s."Id" AND s."Deleted" = false
+                WHERE us."SurveyId" IN %s AND us."Deleted" = false {val_status_cond}
+                GROUP BY us."SurveyId"
+            )
+            SELECT s."Id", s."Name",
+                COALESCE(usp.usuarios_unicos, 0) AS usuarios_unicos,
+                COALESCE(usp.participaciones, 0)  AS participaciones
+            FROM public."Surveys" s
+            LEFT JOIN usp ON s."Id" = usp."SurveyId"
+            WHERE s."Id" IN %s AND s."Deleted" = false
+            """,
+            val_params,
+        )
+        val_rows = {r["Id"]: dict(r) for r in cur.fetchall()}
+
+        surveys_validas = [
+            val_rows[sid]
+            for sid in survey_ids
+            if sid in val_rows and val_rows[sid]["usuarios_unicos"] > 0
+        ]
+
+        if not surveys_validas:
+            raise HTTPException(
+                404,
+                "No se encontraron usuarios para las encuestas seleccionadas. "
+                "Verifica que los IDs sean correctos y que tengan usuarios asignados.",
+            )
+
+        valid_ids = tuple(r["Id"] for r in surveys_validas)
+
+        # ── 2. Nombre del status ─────────────────────────────────────────────
+        status_name = "Todos"
+        if status_id:
+            cur.execute(
+                'SELECT "Name" FROM public."Settings" WHERE "Id" = %s', (status_id,)
+            )
+            st = cur.fetchone()
+            if st:
+                status_name = st["Name"]
+
+        # ── 3. Query principal ───────────────────────────────────────────────
+        us_cond  = 'AND us2."StatusId" = %s' if status_id else ""
+        sub_cond = 'AND us."StatusId"  = %s' if status_id else ""
+
+        main_sql = f"""
+        WITH usuarios_survey AS (
+            SELECT DISTINCT us2."UserId"
+            FROM public."UserSurveys" us2
+            WHERE us2."SurveyId" IN %s AND us2."Deleted" = false {us_cond}
+        )
+        SELECT
+            u."Id",
+            COALESCE(u."Name", '-')                                             AS "Nombre",
+            COALESCE(u."LastName", '-')                                         AS "Apellido",
+            COALESCE(u."MobilNumber", '-')                                      AS "Telefono",
+            COALESCE(u."Email", '-')                                            AS "Correo Electronico",
+            COALESCE(up."Instagram", '-')                                       AS "Usuario Instagram",
+            COALESCE(TO_CHAR(up."BirthDate", 'DD/MM/YYYY'), '-')               AS "Fecha de Nacimiento",
+            COALESCE(EXTRACT(YEAR FROM AGE(up."BirthDate"))::TEXT, '-')        AS "Edad",
+            COALESCE(gender."Name", '-')                                        AS "Genero",
+            COALESCE(marital_status."Name", '-')                               AS "Estado Civil",
+            COALESCE(role_house."Name", '-')                                   AS "Rol Familiar",
+            COALESCE(income_range."Name", '-')                                 AS "Rango de Ingreso",
+            COALESCE(profession."Name", '-')                                   AS "Profesion",
+            COALESCE(STRING_AGG(DISTINCT pet."Name", ' - '), '-')              AS "Mascotas",
+            COALESCE(STRING_AGG(DISTINCT hobby."Name", ' - '), '-')            AS "Hobbies",
+            COALESCE(frequency_activities."Name", '-')                         AS "Frecuencia Actividad Fisica",
+            COALESCE(number_children."Name", '-')                              AS "Numero de Hijos",
+            COALESCE(level_academic."Name", '-')                               AS "Nivel Academico",
+            CASE WHEN up."IsBuyManagerHome"      = TRUE THEN 'SI'
+                 WHEN up."IsBuyManagerHome"      = FALSE THEN 'NO' ELSE '-' END AS "Compras en el Hogar",
+            CASE WHEN up."IsPregnant"            = TRUE THEN 'SI'
+                 WHEN up."IsPregnant"            = FALSE THEN 'NO' ELSE '-' END AS "Embarazo",
+            CASE WHEN up."IsInterestedTechnology"= TRUE THEN 'SI'
+                 WHEN up."IsInterestedTechnology"= FALSE THEN 'NO' ELSE '-' END AS "Interesado en Tecnologia",
+            CASE WHEN up."IsAlcoholConsume"      = TRUE THEN 'SI'
+                 WHEN up."IsAlcoholConsume"      = FALSE THEN 'NO' ELSE '-' END AS "Consume alcohol",
+            CASE WHEN up."IsTobaccoConsume"      = TRUE THEN 'SI'
+                 WHEN up."IsTobaccoConsume"      = FALSE THEN 'NO' ELSE '-' END AS "Consume nicotina",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'),      '\\n', '', 'g') AS "Direccion",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '\\n', '', 'g') AS "Direccion Exacta",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'),  '\\n', '', 'g') AS "Indicaciones",
+            CONCAT(
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'),     '\\n', '', 'g'), ' ',
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '\\n', '', 'g')
+            ) AS "Direccion Completa",
+            COALESCE(
+                up."Zone",
+                (SELECT CAST(
+                    (regexp_matches(
+                        CONCAT(
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'),      '[\\n\\t|$~;,]', '', 'g'), ' ',
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '[\\n\\t|$~;,]', '', 'g'), ' ',
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'),  '[\\n\\t|$~;,]', '', 'g')
+                        ),
+                        '(?:Zona|ZONA|zona|Z\\.)[\\s\\(/]*(\\d+)[\\s\\)/]*.*'
+                    ))[1] AS int
+                )),
+                -1
+            ) AS "Zona",
+            'Guatemala'                                                         AS "Pais",
+            COALESCE(d."DepartmentName", '-')                                  AS "Departamento",
+            COALESCE(c."CityName", '-')                                        AS "Municipio",
+            COALESCE(up."Latitude"::TEXT, '-')                                 AS "Latitude",
+            COALESCE(up."Longitude"::TEXT, '-')                                AS "Longitude",
+            COALESCE(TO_CHAR(up."CreationDate", 'DD/MM/YYYY'), '-')            AS "Fecha de Registro",
+            COALESCE(TO_CHAR(up."LastUserProfileDate", 'DD/MM/YYYY'), '-')     AS "Ultima fecha perfil usuario",
+            COALESCE(TO_CHAR(up."PreviousUserProfileDate", 'DD/MM/YYYY'), '-') AS "Anterior Perfil Fecha",
+            COALESCE(TO_CHAR(u."LastSession", 'DD/MM/YYYY'), '-')              AS "Ultima Sesion",
+            COALESCE(u."IsMigrated"::TEXT, '-')                                AS "Migrado",
+            (
+                SELECT array_agg(
+                    json_build_object(
+                        'survey_id',           us."SurveyId",
+                        'nombre_encuesta',     s."Name",
+                        'descripcion_encuesta',s."Description",
+                        'categoria',           ct."Name",
+                        'url_encuesta',        s."SurveyUrl",
+                        'tipo_encuesta',       st_type."Name",
+                        'estado_encuesta',     st_status."Name",
+                        'fecha_creacion',      TO_CHAR(us."CreationDate", 'DD/MM/YYYY'),
+                        'respuestas',          us."AnswersJson"
+                    )
+                )
+                FROM public."UserSurveys" us
+                LEFT JOIN public."Surveys" s
+                       ON us."SurveyId" = s."Id" AND s."Deleted" = false
+                LEFT JOIN public."Categories" ct
+                       ON s."CategoryId" = ct."Id" AND ct."Deleted" = false
+                LEFT JOIN public."Settings" st_status
+                       ON us."StatusId" = st_status."Id" AND st_status."Deleted" = false
+                LEFT JOIN public."Settings" st_type
+                       ON s."TypeSurveyId" = st_type."Id" AND st_type."Deleted" = false
+                WHERE us."UserId" = u."Id"
+                  AND us."Deleted" = false
+                  AND us."SurveyId" IN %s
+                  {sub_cond}
+            ) AS "Encuestas"
+        FROM public."Users" u
+        JOIN  public."UserProfiles" up   ON u."Id" = up."UserId"
+        LEFT JOIN public."Cities" c      ON up."CityId" = c."Id"
+        LEFT JOIN public."Departments" d ON c."DepartmentId" = d."Id"
+        LEFT JOIN public."Settings" gender             ON up."GenderId"                     = gender."Id"
+        LEFT JOIN public."Settings" marital_status     ON up."MaritalStatusId"               = marital_status."Id"
+        LEFT JOIN public."Settings" role_house         ON up."RoleHouseId"                   = role_house."Id"
+        LEFT JOIN public."Settings" income_range       ON up."IncomeRangeId"                 = income_range."Id"
+        LEFT JOIN public."Settings" profession         ON up."ProfessionsId"                 = profession."Id"
+        LEFT JOIN public."Settings" frequency_activities ON up."FrequencyActivitiesPhysicalId" = frequency_activities."Id"
+        LEFT JOIN public."Settings" pet   ON pet."Id"   = ANY(string_to_array(up."PetsId", ',')::int[])
+        LEFT JOIN public."Settings" hobby ON hobby."Id" = ANY(string_to_array(up."HobbiesId", ',')::int[])
+        LEFT JOIN public."Settings" number_children ON up."NumberChildrenId" = number_children."Id"
+        LEFT JOIN public."Settings" level_academic  ON up."LevelAcademicId"  = level_academic."Id"
+        WHERE u."Id" IN (SELECT "UserId" FROM usuarios_survey)
+        GROUP BY
+            u."Id", u."Name", u."LastName", u."MobilNumber", u."Email", up."Instagram",
+            up."BirthDate", gender."Name", marital_status."Name", role_house."Name",
+            income_range."Name", profession."Name", frequency_activities."Name",
+            up."Address", up."ExactAddress", up."Instruction", up."Zone",
+            d."DepartmentName", c."CityName", up."Latitude", up."Longitude",
+            up."CreationDate", up."LastUserProfileDate", up."PreviousUserProfileDate",
+            u."LastSession", u."IsMigrated", up."IsBuyManagerHome", up."IsPregnant",
+            up."IsInterestedTechnology", up."IsAlcoholConsume", up."IsTobaccoConsume",
+            number_children."Name", level_academic."Name"
+        ORDER BY u."Id"
+        """
+
+        main_params: list = [valid_ids]
+        if status_id:
+            main_params.append(status_id)
+        main_params.append(valid_ids)
+        if status_id:
+            main_params.append(status_id)
+
+        cur.execute(main_sql, main_params)
+        rows = [dict(r) for r in cur.fetchall()]
+
+    # ── 4. Separar datos de usuario y respuestas ─────────────────────────────
+    base_cols = [k for k in (rows[0].keys() if rows else []) if k != "Encuestas"]
+    users_data: list = []
+    dfs_encuestas: dict = {}  # clave → {'info': {...}, 'datos': [...]}
+
+    for row in rows:
+        users_data.append({c: row[c] for c in base_cols})
+
+        info_usuario = {
+            "Id":                   row.get("Id"),
+            "Nombre":               row.get("Nombre"),
+            "Apellido":             row.get("Apellido"),
+            "Correo Electronico":   row.get("Correo Electronico"),
+            "Telefono":             row.get("Telefono"),
+        }
+
+        for enc in (row.get("Encuestas") or []):
+            sid   = enc.get("survey_id")
+            nombre = enc.get("nombre_encuesta") or str(sid)
+            clave  = f"{sid} - {nombre}"
+
+            if clave not in dfs_encuestas:
+                dfs_encuestas[clave] = {"info": enc, "datos": []}
+
+            s_row = info_usuario.copy()
+            answers_raw = enc.get("respuestas")
+            if answers_raw:
+                try:
+                    answers = (
+                        _json.loads(answers_raw)
+                        if isinstance(answers_raw, str)
+                        else answers_raw
+                    )
+                    if isinstance(answers, dict):
+                        for _k, v in answers.items():
+                            if isinstance(v, dict) and "question" in v and "option" in v:
+                                q = v["question"].get("question", _k)
+                                a = v["option"].get("answer", "-")
+                            else:
+                                q, a = str(_k), str(v)
+                            s_row[str(q).replace(",", " - ")] = str(a).replace(",", " - ")
+                except Exception:
+                    pass
+            dfs_encuestas[clave]["datos"].append(s_row)
+
+    # ── 5. Construir Excel ───────────────────────────────────────────────────
+    total_usuarios      = len(users_data)
+    total_participaciones = sum(s["participaciones"] for s in surveys_validas)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+
+        # Hoja Usuarios
+        df_users = (
+            pd.DataFrame(users_data)
+            if users_data
+            else pd.DataFrame([{"Info": "Sin datos"}])
+        )
+        df_users.to_excel(writer, sheet_name="Usuarios", index=False)
+
+        # Una hoja por encuesta con respuestas expandidas
+        used_sheet_names: set = {"Usuarios"}
+        for clave, info in dfs_encuestas.items():
+            if not info["datos"]:
+                continue
+            sid    = info["info"]["survey_id"]
+            nombre = info["info"]["nombre_encuesta"] or str(sid)
+            base   = f"Survey_{sid}_{_clean_sheet_name(nombre)}"[:31]
+            # evitar duplicados
+            sheet_name = base
+            suffix = 2
+            while sheet_name in used_sheet_names:
+                sheet_name = f"{base[:28]}_{suffix}"
+                suffix += 1
+            used_sheet_names.add(sheet_name)
+            pd.DataFrame(info["datos"]).to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Hoja Surveys
+        surveys_sheet = [
+            {
+                "Survey ID":            s["Id"],
+                "Nombre":               s["Name"],
+                "Usuarios Unicos":      s["usuarios_unicos"],
+                "Participaciones":      s["participaciones"],
+                "StatusId Filtrado":    status_id if status_id else "Todos",
+                "Estado de la Encuesta": status_name,
+            }
+            for s in surveys_validas
+        ]
+        pd.DataFrame(surveys_sheet).to_excel(writer, sheet_name="Surveys", index=False)
+
+        # Hoja Resumen
+        resumen = {
+            "Metrica": ["Usuarios Unicos", "Participaciones Totales", "Surveys Incluidas"],
+            "Valor":   [total_usuarios, total_participaciones, len(surveys_validas)],
+            "StatusId Filtrado":     [status_id if status_id else "Todos"] * 3,
+            "Estado de la Encuesta": [status_name] * 3,
+        }
+        pd.DataFrame(resumen).to_excel(writer, sheet_name="Resumen", index=False)
+
+    output.seek(0)
+    fecha = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        iter([output.read()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename=reporte_encuestas_{fecha}.xlsx"
+        },
+    )
+
+
 @router.get("/{survey_id}")
 def get_survey(survey_id: int, _: dict = Depends(get_current_admin)):
     with get_db() as conn:
@@ -152,12 +507,20 @@ def get_survey(survey_id: int, _: dict = Depends(get_current_admin)):
         cur.execute(
             """
             SELECT u."Id", u."Name", u."LastName", u."Email",
-                   us."StatusId", us."AnsweredDate", us."AnswersJson",
-                   st."Name" AS status_name
+                   us."StatusId", us."AnsweredDate",
+                   st."Name" AS status_name,
+                   COALESCE(EXTRACT(YEAR FROM AGE(up."BirthDate"))::TEXT, '-') AS edad,
+                   COALESCE(gender."Name", '-') AS genero,
+                   COALESCE(d."DepartmentName", '-') AS departamento,
+                   COALESCE(c."CityName", '-') AS ciudad
             FROM public."UserSurveys" us
             JOIN public."Users" u ON us."UserId" = u."Id"
+            LEFT JOIN public."UserProfiles" up ON u."Id" = up."UserId"
             LEFT JOIN public."Settings" st ON us."StatusId" = st."Id"
-            WHERE us."SurveyId" = %s
+            LEFT JOIN public."Settings" gender ON up."GenderId" = gender."Id"
+            LEFT JOIN public."Cities" c ON up."CityId" = c."Id"
+            LEFT JOIN public."Departments" d ON c."DepartmentId" = d."Id"
+            WHERE us."SurveyId" = %s AND us."Deleted" IS DISTINCT FROM TRUE
             ORDER BY us."AnsweredDate" DESC NULLS LAST
             """,
             (survey_id,),
@@ -170,29 +533,225 @@ def get_survey(survey_id: int, _: dict = Depends(get_current_admin)):
 @router.get("/{survey_id}/users/export")
 def export_survey_users(
     survey_id: int,
-    format: str = Query("xlsx", pattern="^(xlsx|csv)$"),
+    status_id: Optional[int] = Query(None, description="Filtro opcional de status"),
+    format: Optional[str] = Query("xlsx"),
     _: dict = Depends(get_current_admin),
 ):
+    import json as _json
+    import unicodedata
+    import re
+
+    def clean_sheet_name(name: str) -> str:
+        name = unicodedata.normalize('NFKD', str(name))
+        name = name.encode('ASCII', 'ignore').decode('ASCII')
+        name = re.sub(r'[^\w\-_]', '_', name)
+        return name[:31]
+
+    status_cond = "AND \"StatusId\" = %s" if status_id else ""
+    status_cond_us = "AND us.\"StatusId\" = %s" if status_id else ""
+
+    user_sql = f"""
+        WITH usuarios_survey AS (
+            SELECT DISTINCT "UserId"
+            FROM public."UserSurveys"
+            WHERE "SurveyId" = %s AND "Deleted" IS DISTINCT FROM TRUE
+            {status_cond}
+        )
+        SELECT 
+            u."Id",
+            COALESCE(u."Name", '-') AS "Nombre",
+            COALESCE(u."LastName", '-') AS "Apellido",
+            COALESCE(u."MobilNumber", '-') AS "Teléfono",
+            COALESCE(u."Email", '-') AS "Correo Electrónico",
+            COALESCE(up."Instagram", '-') AS "Usuario Instragram",
+            COALESCE(TO_CHAR(up."BirthDate", 'DD/MM/YYYY'), '-') AS "Fecha de Nacimiento",
+            COALESCE(EXTRACT(YEAR FROM AGE(up."BirthDate"))::TEXT, '-') AS "Edad",
+            COALESCE(gender."Name", '-') AS "Género",
+            COALESCE(marital_status."Name", '-') AS "Estado Civil",
+            COALESCE(role_house."Name", '-') AS "Rol Familiar",
+            COALESCE(income_range."Name", '-') AS "Rango de Ingreso",
+            COALESCE(profession."Name", '-') AS "Profesión",
+            COALESCE(STRING_AGG(DISTINCT pet."Name", ' - '), '-') AS "Mascotas",
+            COALESCE(STRING_AGG(DISTINCT hobby."Name", ' - '), '-') AS "Hobbies",
+            COALESCE(frequency_activities."Name", '-') AS "Frecuencia Actividad Física",
+            COALESCE(number_children."Name", '-') AS "Número de Hijos",
+            COALESCE(level_academic."Name", '-') AS "Nivel Academico",
+            CASE WHEN up."IsBuyManagerHome" = TRUE THEN 'SI' WHEN up."IsBuyManagerHome" = FALSE THEN 'NO' ELSE '-' END AS "Compras en el Hogar",
+            CASE WHEN up."IsPregnant" = TRUE THEN 'SI' WHEN up."IsPregnant" = FALSE THEN 'NO' ELSE '-' END AS "Embarazo",
+            CASE WHEN up."IsInterestedTechnology" = TRUE THEN 'SI' WHEN up."IsInterestedTechnology" = FALSE THEN 'NO' ELSE '-' END AS "Interesado en Tecnología",
+            CASE WHEN up."IsAlcoholConsume" = TRUE THEN 'SI' WHEN up."IsAlcoholConsume" = FALSE THEN 'NO' ELSE '-' END AS "Consume alcohol",
+            CASE WHEN up."IsTobaccoConsume" = TRUE THEN 'SI' WHEN up."IsTobaccoConsume" = FALSE THEN 'NO' ELSE '-' END AS "Consume nicotina",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '\\n', '', 'g') AS "Dirección",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '\\n', '', 'g') AS "Dirección Exacta",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '\\n', '', 'g') AS "Indicaciones",
+            CONCAT(
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '\\n', '', 'g'), ' ',
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '\\n', '', 'g')
+            ) AS "Dirección Completa",
+            COALESCE(
+                up."Zone",
+                (
+                    SELECT CAST((regexp_matches(
+                        CONCAT(
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '[\\n\\t|$~;,]', '', 'g'), ' ',
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '[\\n\\t|$~;,]', '', 'g'), ' ',
+                            REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '[\\n\\t|$~;,]', '', 'g')
+                        ),
+                        '(?:Zona|ZONA|zona|ZONA: |zona: |Zona: |ZONA:|zona:|Zona:|Z\\.|z\\.|Z|z)[\\s\\(/]*(\\d+)[\\s\\)/]*.*'
+                    ))[1] AS int)
+                ),
+                -1
+            ) AS "Zona",
+            COALESCE(NULL, 'Guatemala') AS "País",
+            COALESCE(d."DepartmentName", '-') AS "Departamento",
+            COALESCE(c."CityName", '-') AS "Municipio",
+            COALESCE(up."Latitude"::TEXT, '-') AS "Latitude",
+            COALESCE(up."Longitude"::TEXT, '-') AS "Longitude",
+            COALESCE(TO_CHAR(up."CreationDate", 'DD/MM/YYYY'), '-') AS "Fecha de Registro",
+            COALESCE(TO_CHAR(up."LastUserProfileDate", 'DD/MM/YYYY'), '-') AS "Última fecha del perfil de usuario",
+            COALESCE(TO_CHAR(up."PreviousUserProfileDate", 'DD/MM/YYYY'), '-') AS "Anterior Perfil de usuario Fecha",
+            COALESCE(TO_CHAR(u."LastSession", 'DD/MM/YYYY'), '-') AS "Última Sesión",
+            COALESCE(u."IsMigrated"::TEXT, '-') AS "Migrado",
+            (
+                SELECT json_agg(
+                    json_build_object(
+                        'survey_id', us."SurveyId",
+                        'nombre_encuesta', s."Name",
+                        'respuestas', us."AnswersJson"
+                    ) ORDER BY us."SurveyId"
+                )
+                FROM public."UserSurveys" us
+                LEFT JOIN public."Surveys" s ON us."SurveyId"=s."Id" AND s."Deleted" IS DISTINCT FROM TRUE
+                WHERE us."UserId"=u."Id" AND us."SurveyId"=%s AND us."Deleted" IS DISTINCT FROM TRUE
+                {status_cond_us}
+            ) AS "_survey_data"
+        FROM public."Users" u
+        JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+        LEFT JOIN public."Cities" c ON up."CityId" = c."Id"
+        LEFT JOIN public."Departments" d ON c."DepartmentId" = d."Id"
+        LEFT JOIN public."Settings" gender ON up."GenderId" = gender."Id"
+        LEFT JOIN public."Settings" marital_status ON up."MaritalStatusId" = marital_status."Id"
+        LEFT JOIN public."Settings" role_house ON up."RoleHouseId" = role_house."Id"
+        LEFT JOIN public."Settings" income_range ON up."IncomeRangeId" = income_range."Id"
+        LEFT JOIN public."Settings" profession ON up."ProfessionsId" = profession."Id"
+        LEFT JOIN public."Settings" frequency_activities ON up."FrequencyActivitiesPhysicalId" = frequency_activities."Id"
+        LEFT JOIN public."Settings" pet ON pet."Id" = ANY(string_to_array(up."PetsId", ',')::int[])
+        LEFT JOIN public."Settings" hobby ON hobby."Id" = ANY(string_to_array(up."HobbiesId", ',')::int[])
+        LEFT JOIN public."Settings" number_children ON up."NumberChildrenId" = number_children."Id"
+        LEFT JOIN public."Settings" level_academic ON up."LevelAcademicId" = level_academic."Id"
+        WHERE u."Id" IN (SELECT "UserId" FROM usuarios_survey)
+        GROUP BY
+            u."Id", u."Name", u."LastName", u."MobilNumber", u."Email", up."Instagram",
+            up."BirthDate", gender."Name", marital_status."Name", role_house."Name",
+            income_range."Name", profession."Name", frequency_activities."Name",
+            up."Address", up."ExactAddress", up."Instruction", up."Zone",
+            d."DepartmentName", c."CityName", up."Latitude", up."Longitude",
+            up."CreationDate", up."LastUserProfileDate", up."PreviousUserProfileDate",
+            u."LastSession", u."IsMigrated", up."IsBuyManagerHome", up."IsPregnant",
+            up."IsInterestedTechnology", up."IsAlcoholConsume", up."IsTobaccoConsume",
+            number_children."Name", level_academic."Name"
+        ORDER BY u."Id"
+    """
+
+    sql_params = [survey_id]
+    if status_id:
+        sql_params.append(status_id)
+    sql_params.append(survey_id)
+    if status_id:
+        sql_params.append(status_id)
+
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT u."Id", u."Name" AS "Nombre", u."LastName" AS "Apellido",
-                   u."Email" AS "Correo", u."MobilNumber" AS "Teléfono",
-                   st."Name" AS "Estado Encuesta",
-                   TO_CHAR(us."AnsweredDate", 'DD/MM/YYYY HH24:MI') AS "Fecha Respuesta"
-            FROM public."UserSurveys" us
-            JOIN public."Users" u ON us."UserId" = u."Id"
-            LEFT JOIN public."Settings" st ON us."StatusId" = st."Id"
-            WHERE us."SurveyId" = %s
-            ORDER BY us."AnsweredDate" DESC NULLS LAST
-            """,
-            (survey_id,),
-        )
+        cur.execute(user_sql, sql_params)
         rows = [dict(r) for r in cur.fetchall()]
 
-    df = pd.DataFrame(rows)
-    return _export_response(df, f"encuesta_{survey_id}_usuarios", format)
+        cur.execute('SELECT "Id", "Name" FROM public."Surveys" WHERE "Id"=%s', (survey_id,))
+        survey = cur.fetchone()
+        if not survey:
+            raise HTTPException(404, "Encuesta no encontrada")
+        survey_name = survey["Name"]
+
+        status_name = "Todos"
+        if status_id:
+            cur.execute('SELECT "Name" FROM public."Settings" WHERE "Id" = %s', (status_id,))
+            st_res = cur.fetchone()
+            if st_res:
+                status_name = st_res["Name"]
+
+    base_cols = [k for k in (rows[0].keys() if rows else []) if k != "_survey_data"]
+    users_data = []
+    survey_data = []
+
+    for row in rows:
+        surveys_res = row.get("_survey_data") or []
+        user_row = {c: row[c] for c in base_cols if c in row}
+        users_data.append(user_row)
+
+        info_usuario = {
+            'Id': row.get('Id'),
+            'Nombre': row.get('Nombre'),
+            'Apellido': row.get('Apellido'),
+            'Correo Electrónico': row.get('Correo Electrónico'),
+            'Teléfono': row.get('Teléfono')
+        }
+
+        for entry in surveys_res:
+            s_row = info_usuario.copy()
+            answers_raw = entry.get("respuestas")
+            if answers_raw:
+                try:
+                    answers = _json.loads(answers_raw) if isinstance(answers_raw, str) else answers_raw
+                    if isinstance(answers, dict):
+                        for _k, v in answers.items():
+                            if isinstance(v, dict) and "question" in v and "option" in v:
+                                q = v["question"].get("question", _k)
+                                a = v["option"].get("answer", "-")
+                            else:
+                                q, a = str(_k), str(v)
+                            q_clean = str(q).replace(',', ' - ')
+                            a_clean = str(a).replace(',', ' - ')
+                            s_row[q_clean] = a_clean
+                except Exception:
+                    pass
+            survey_data.append(s_row)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Hoja Usuarios
+        df_users = pd.DataFrame(users_data) if users_data else pd.DataFrame([{"Info": "Sin datos"}])
+        df_users.to_excel(writer, sheet_name="Usuarios", index=False)
+
+        # Hoja Encuesta específica con respuestas expandidas
+        sheet_name = f"Survey_{survey_id}_{clean_sheet_name(survey_name)}"[:31]
+        df_survey = pd.DataFrame(survey_data) if survey_data else pd.DataFrame([{"Info": "Sin respuestas"}])
+        df_survey.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        # Hoja Surveys
+        surveys_info = [{
+            'Survey ID': survey_id,
+            'Nombre': survey_name,
+            'Usuarios Únicos': len(set(r['Id'] for r in survey_data)),
+            'Participaciones': len(survey_data),
+            'StatusId Filtrado': status_id if status_id else 'Todos',
+            'Estado de la Encuesta': status_name
+        }]
+        pd.DataFrame(surveys_info).to_excel(writer, sheet_name="Surveys", index=False)
+        
+        # Hoja Resumen
+        resumen_data = {
+            'Métrica': ['Usuarios Únicos', 'Participaciones Totales', 'Surveys Incluidas'],
+            'Valor': [len(users_data), len(survey_data), 1],
+            'StatusId Filtrado': [status_id if status_id else 'Todos'] * 3,
+            'Estado de la Encuesta': [status_name] * 3
+        }
+        pd.DataFrame(resumen_data).to_excel(writer, sheet_name="Resumen", index=False)
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.read()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=reporte_encuesta_{survey_id}.xlsx"},
+    )
 
 
 @router.post("")
@@ -536,7 +1095,11 @@ async def assign_users_excel_survey(
     status_id: int = Form(146),
     _: dict = Depends(get_current_admin),
 ):
-    """Asigna usuarios a la encuesta desde un Excel con columna 'user_id'."""
+    """
+    Asigna usuarios a la encuesta desde un Excel con columna 'user_id'.
+    Usa bulk queries (ANY + execute_values) para soportar miles de registros
+    sin timeout: 3 queries totales en lugar de N×3.
+    """
     contents = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(contents))
@@ -547,40 +1110,68 @@ async def assign_users_excel_survey(
     if col is None:
         raise HTTPException(400, "El archivo debe tener una columna llamada 'user_id'")
 
-    assigned = 0
-    skipped = 0
-    errors = []
+    # ── 1. Parsear todos los IDs del Excel ──────────────────────────────────
+    errors: list = []
+    candidate_ids: list[int] = []
+    uid_to_row: dict[int, int] = {}
+
+    for i, row in df.iterrows():
+        row_num = int(i) + 2
+        raw = row[col]
+        try:
+            uid = int(raw)
+            candidate_ids.append(uid)
+            uid_to_row.setdefault(uid, row_num)
+        except (ValueError, TypeError):
+            errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
+
+    if not candidate_ids:
+        return {"assigned": 0, "skipped": 0, "errors": errors}
+
     with get_db() as conn:
         cur = conn.cursor()
-        for i, row in df.iterrows():
-            row_num = int(i) + 2
-            raw = row[col]
-            try:
-                uid = int(raw)
-            except (ValueError, TypeError):
-                errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
-                continue
-            cur.execute(
-                'SELECT "Id" FROM public."Users" WHERE "Id"=%s AND "Deleted" IS DISTINCT FROM TRUE',
-                (uid,),
+
+        # ── 2. Validar existencia en una sola query ─────────────────────────
+        cur.execute(
+            'SELECT "Id" FROM public."Users" WHERE "Id" = ANY(%s) AND "Deleted" IS DISTINCT FROM TRUE',
+            (candidate_ids,),
+        )
+        valid_ids: set[int] = {r["Id"] for r in cur.fetchall()}
+
+        for uid in set(candidate_ids) - valid_ids:
+            errors.append({
+                "row": uid_to_row.get(uid),
+                "user_id": uid,
+                "reason": "Usuario no encontrado",
+            })
+
+        if not valid_ids:
+            return {"assigned": 0, "skipped": 0, "errors": errors}
+
+        # ── 3. Detectar ya asignados en una sola query ──────────────────────
+        cur.execute(
+            'SELECT "UserId" FROM public."UserSurveys" WHERE "SurveyId"=%s AND "UserId" = ANY(%s)',
+            (survey_id, list(valid_ids)),
+        )
+        already_assigned: set[int] = {r["UserId"] for r in cur.fetchall()}
+        skipped = len(already_assigned)
+
+        # ── 4. INSERT masivo en una sola query ──────────────────────────────
+        to_insert = list(valid_ids - already_assigned)
+        assigned = 0
+        if to_insert:
+            now = datetime.utcnow()
+            execute_values(
+                cur,
+                'INSERT INTO public."UserSurveys" '
+                '("UserId","SurveyId","AnswersJson","CreationDate","Deleted","StatusId","AnsweredDate") '
+                "VALUES %s",
+                [(uid, survey_id, None, now, False, status_id, None) for uid in to_insert],
             )
-            if not cur.fetchone():
-                errors.append({"row": row_num, "user_id": uid, "reason": "Usuario no encontrado"})
-                continue
-            cur.execute(
-                'SELECT "Id" FROM public."UserSurveys" WHERE "UserId"=%s AND "SurveyId"=%s',
-                (uid, survey_id),
-            )
-            if cur.fetchone():
-                skipped += 1
-                continue
-            cur.execute(
-                'INSERT INTO public."UserSurveys" ("UserId","SurveyId","AnswersJson","CreationDate","Deleted","StatusId","AnsweredDate") '
-                "VALUES (%s,%s,NULL,NOW() AT TIME ZONE 'UTC',FALSE,%s,NULL)",
-                (uid, survey_id, status_id),
-            )
-            assigned += 1
+            assigned = len(to_insert)
+
         conn.commit()
+
     return {"assigned": assigned, "skipped": skipped, "errors": errors}
 
 
@@ -691,31 +1282,29 @@ def preview_users_for_survey(
 
 # ─── Internal survey report (Excel) ──────────────────────────────────────────
 
-class InternalReportRequest(BaseModel):
-    survey_ids: list
-    status_id: Optional[int] = None
-
-
 import unicodedata, re
 
 def _clean_sheet_name(name: str) -> str:
-    name = unicodedata.normalize('NFKD', str(name)).encode('ASCII', 'ignore').decode('ASCII')
-    name = re.sub(r'[^\w\-_ ]', '_', name)
+    name = unicodedata.normalize('NFKD', str(name))
+    name = name.encode('ASCII', 'ignore').decode('ASCII')
+    name = re.sub(r'[^\w\-_]', '_', name)
     return name[:31]
 
 
-@router.post("/internal-report")
-def generate_internal_report(body: InternalReportRequest, _: dict = Depends(get_current_admin)):
+@router.get("/internal-report")
+def generate_internal_report(
+    survey_ids: str = Query(..., description="IDs separados por comas, ej: 1,2,3"),
+    status_id: Optional[int] = Query(None, description="Filtro opcional de status"),
+    _: dict = Depends(get_current_admin)
+):
     """Genera Excel con datos de usuarios + respuestas por encuesta (una hoja por encuesta)."""
-    if not body.survey_ids:
-        raise HTTPException(400, "Debe proporcionar al menos un ID de encuesta")
+    s_ids = [int(x.strip()) for x in survey_ids.split(",") if x.strip().isdigit()]
+    if not s_ids:
+        raise HTTPException(400, "Debe proporcionar al menos un ID de encuesta válido")
 
-    survey_ids = [int(x) for x in body.survey_ids]
+    status_cond = "AND \"StatusId\" = %s" if status_id else ""
+    status_cond_us = "AND us.\"StatusId\" = %s" if status_id else ""
 
-    # Build full user query (reuse users.py BASE_SELECT/FROM/GROUP structure)
-    from app.api.users import BASE_SELECT, BASE_FROM, BASE_GROUP
-
-    status_cond = "AND us.\"StatusId\" = %s" if body.status_id else ""
     user_sql = f"""
         WITH usuarios_survey AS (
             SELECT DISTINCT "UserId"
@@ -723,37 +1312,143 @@ def generate_internal_report(body: InternalReportRequest, _: dict = Depends(get_
             WHERE "SurveyId" = ANY(%s) AND "Deleted" IS DISTINCT FROM TRUE
             {status_cond}
         )
-        {BASE_SELECT},
-        (
-            SELECT json_agg(
-                json_build_object(
-                    'survey_id', us."SurveyId",
-                    'survey_name', s."Name",
-                    'status_name', st."Name",
-                    'status_id', us."StatusId",
-                    'answered_date', TO_CHAR(us."AnsweredDate", 'DD/MM/YYYY HH24:MI'),
-                    'answers_json', us."AnswersJson"
-                ) ORDER BY us."SurveyId"
-            )
-            FROM public."UserSurveys" us
-            LEFT JOIN public."Surveys" s ON us."SurveyId"=s."Id"
-            LEFT JOIN public."Settings" st ON us."StatusId"=st."Id"
-            WHERE us."UserId"=u."Id" AND us."SurveyId"=ANY(%s) AND us."Deleted" IS DISTINCT FROM TRUE
-            {status_cond}
-        ) AS "_survey_data"
-        {BASE_FROM}
+        SELECT 
+            u."Id",
+            COALESCE(u."Name", '-') AS "Nombre",
+            COALESCE(u."LastName", '-') AS "Apellido",
+            COALESCE(u."MobilNumber", '-') AS "Teléfono",
+            COALESCE(u."Email", '-') AS "Correo Electrónico",
+            COALESCE(up."Instagram", '-') AS "Usuario Instragram",
+            COALESCE(TO_CHAR(up."BirthDate", 'DD/MM/YYYY'), '-') AS "Fecha de Nacimiento",
+            COALESCE(EXTRACT(YEAR FROM AGE(up."BirthDate"))::TEXT, '-') AS "Edad",
+            COALESCE(gender."Name", '-') AS "Género",
+            COALESCE(marital_status."Name", '-') AS "Estado Civil",
+            COALESCE(role_house."Name", '-') AS "Rol Familiar",
+            COALESCE(income_range."Name", '-') AS "Rango de Ingreso",
+            COALESCE(profession."Name", '-') AS "Profesión",
+            COALESCE(STRING_AGG(DISTINCT pet."Name", ' - '), '-') AS "Mascotas",
+            COALESCE(STRING_AGG(DISTINCT hobby."Name", ' - '), '-') AS "Hobbies",
+            COALESCE(frequency_activities."Name", '-') AS "Frecuencia Actividad Física",
+            COALESCE(number_children."Name", '-') AS "Número de Hijos",
+            COALESCE(level_academic."Name", '-') AS "Nivel Academico",
+            CASE
+                WHEN up."IsBuyManagerHome" = TRUE THEN 'SI'
+                WHEN up."IsBuyManagerHome" = FALSE THEN 'NO'
+                ELSE '-'
+            END AS "Compras en el Hogar",
+            CASE
+                WHEN up."IsPregnant" = TRUE THEN 'SI'
+                WHEN up."IsPregnant" = FALSE THEN 'NO'
+                ELSE '-'
+            END AS "Embarazo",
+            CASE
+                WHEN up."IsInterestedTechnology" = TRUE THEN 'SI'
+                WHEN up."IsInterestedTechnology" = FALSE THEN 'NO'
+                ELSE '-'
+            END AS "Interesado en Tecnología",
+            CASE
+                WHEN up."IsAlcoholConsume" = TRUE THEN 'SI'
+                WHEN up."IsAlcoholConsume" = FALSE THEN 'NO'
+                ELSE '-'
+            END AS "Consume alcohol",
+            CASE
+                WHEN up."IsTobaccoConsume" = TRUE THEN 'SI'
+                WHEN up."IsTobaccoConsume" = FALSE THEN 'NO'
+                ELSE '-'
+            END AS "Consume nicotina",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '\\n', '', 'g') AS "Dirección",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '\\n', '', 'g') AS "Dirección Exacta",
+            REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '\\n', '', 'g') AS "Indicaciones",
+            CONCAT(
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '\\n', '', 'g'),
+                ' ',
+                REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '\\n', '', 'g')
+            ) AS "Dirección Completa",
+            COALESCE(
+                up."Zone",
+                (
+                    SELECT
+                        CAST(
+                            (regexp_matches(
+                                CONCAT(
+                                    REGEXP_REPLACE(COALESCE(NULLIF(up."Address", ''), '-'), '[\\n\\t|$~;,]', '', 'g'),
+                                    ' ',
+                                    REGEXP_REPLACE(COALESCE(NULLIF(up."ExactAddress", ''), '-'), '[\\n\\t|$~;,]', '', 'g'),
+                                    ' ',
+                                    REGEXP_REPLACE(COALESCE(NULLIF(up."Instruction", ''), '-'), '[\\n\\t|$~;,]', '', 'g')
+                                ),
+                                '(?:Zona|ZONA|zona|ZONA: |zona: |Zona: |ZONA:|zona:|Zona:|Z\\.|z\\.|Z|z)[\\s\\(/]*(\\d+)[\\s\\)/]*.*'
+                            ))[1] AS int
+                        )
+                ),
+                -1
+            ) AS "Zona",
+            COALESCE(NULL, 'Guatemala') AS "País",
+            COALESCE(d."DepartmentName", '-') AS "Departamento",
+            COALESCE(c."CityName", '-') AS "Municipio",
+            COALESCE(up."Latitude"::TEXT, '-') AS "Latitude",
+            COALESCE(up."Longitude"::TEXT, '-') AS "Longitude",
+            COALESCE(TO_CHAR(up."CreationDate", 'DD/MM/YYYY'), '-') AS "Fecha de Registro",
+            COALESCE(TO_CHAR(up."LastUserProfileDate", 'DD/MM/YYYY'), '-') AS "Última fecha del perfil de usuario",
+            COALESCE(TO_CHAR(up."PreviousUserProfileDate", 'DD/MM/YYYY'), '-') AS "Anterior Perfil de usuario Fecha",
+            COALESCE(TO_CHAR(u."LastSession", 'DD/MM/YYYY'), '-') AS "Última Sesión",
+            COALESCE(u."IsMigrated"::TEXT, '-') AS "Migrado",
+            (
+                SELECT json_agg(
+                    json_build_object(
+                        'survey_id', us."SurveyId",
+                        'nombre_encuesta', s."Name",
+                        'descripcion_encuesta', s."Description",
+                        'categoria', ct."Name",
+                        'url_encuesta', s."SurveyUrl",
+                        'tipo_encuesta', st_type."Name",
+                        'estado_encuesta', st_status."Name", 
+                        'fecha_creacion', TO_CHAR(us."CreationDate", 'DD/MM/YYYY'),
+                        'respuestas', us."AnswersJson"
+                    ) ORDER BY us."SurveyId"
+                )
+                FROM public."UserSurveys" us
+                LEFT JOIN public."Surveys" s ON us."SurveyId"=s."Id" AND s."Deleted" IS DISTINCT FROM TRUE
+                LEFT JOIN public."Categories" ct ON s."CategoryId"=ct."Id" AND ct."Deleted" IS DISTINCT FROM TRUE
+                LEFT JOIN public."Settings" st_status ON us."StatusId"=st_status."Id" AND st_status."Deleted" IS DISTINCT FROM TRUE
+                LEFT JOIN public."Settings" st_type ON s."TypeSurveyId"=st_type."Id" AND st_type."Deleted" IS DISTINCT FROM TRUE
+                WHERE us."UserId"=u."Id" AND us."SurveyId"=ANY(%s) AND us."Deleted" IS DISTINCT FROM TRUE
+                {status_cond_us}
+            ) AS "_survey_data"
+        FROM public."Users" u
+        JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+        LEFT JOIN public."Cities" c ON up."CityId" = c."Id"
+        LEFT JOIN public."Departments" d ON c."DepartmentId" = d."Id"
+        LEFT JOIN public."Settings" gender ON up."GenderId" = gender."Id"
+        LEFT JOIN public."Settings" marital_status ON up."MaritalStatusId" = marital_status."Id"
+        LEFT JOIN public."Settings" role_house ON up."RoleHouseId" = role_house."Id"
+        LEFT JOIN public."Settings" income_range ON up."IncomeRangeId" = income_range."Id"
+        LEFT JOIN public."Settings" profession ON up."ProfessionsId" = profession."Id"
+        LEFT JOIN public."Settings" frequency_activities ON up."FrequencyActivitiesPhysicalId" = frequency_activities."Id"
+        LEFT JOIN public."Settings" pet ON pet."Id" = ANY(string_to_array(up."PetsId", ',')::int[])
+        LEFT JOIN public."Settings" hobby ON hobby."Id" = ANY(string_to_array(up."HobbiesId", ',')::int[])
+        LEFT JOIN public."Settings" number_children ON up."NumberChildrenId" = number_children."Id"
+        LEFT JOIN public."Settings" level_academic ON up."LevelAcademicId" = level_academic."Id"
         WHERE u."Id" IN (SELECT "UserId" FROM usuarios_survey)
-        AND u."Deleted" IS DISTINCT FROM TRUE
-        {BASE_GROUP}
+        GROUP BY
+            u."Id", u."Name", u."LastName", u."MobilNumber", u."Email", up."Instagram",
+            up."BirthDate", gender."Name", marital_status."Name", role_house."Name",
+            income_range."Name", profession."Name", frequency_activities."Name",
+            up."Address", up."ExactAddress", up."Instruction", up."Zone",
+            d."DepartmentName", c."CityName", up."Latitude", up."Longitude",
+            up."CreationDate", up."LastUserProfileDate", up."PreviousUserProfileDate",
+            u."LastSession", u."IsMigrated", up."IsBuyManagerHome", up."IsPregnant",
+            up."IsInterestedTechnology", up."IsAlcoholConsume", up."IsTobaccoConsume",
+            number_children."Name", level_academic."Name"
         ORDER BY u."Id"
     """
 
-    sql_params = [survey_ids]
-    if body.status_id:
-        sql_params.append(body.status_id)
-    sql_params.append(survey_ids)
-    if body.status_id:
-        sql_params.append(body.status_id)
+    sql_params = [s_ids]
+    if status_id:
+        sql_params.append(status_id)
+    sql_params.append(s_ids)
+    if status_id:
+        sql_params.append(status_id)
 
     with get_db() as conn:
         cur = conn.cursor()
@@ -763,26 +1458,44 @@ def generate_internal_report(body: InternalReportRequest, _: dict = Depends(get_
         # Get survey names for sheet naming
         cur.execute(
             'SELECT "Id", "Name" FROM public."Surveys" WHERE "Id"=ANY(%s)',
-            (survey_ids,),
+            (s_ids,),
         )
         survey_names = {r["Id"]: r["Name"] for r in cur.fetchall()}
+        
+        status_name = "Todos"
+        if status_id:
+            cur.execute('SELECT "Name" FROM public."Settings" WHERE "Id" = %s', (status_id,))
+            st_res = cur.fetchone()
+            if st_res:
+                status_name = st_res["Name"]
 
     # Process rows into per-survey DataFrames
     base_cols = [k for k in (rows[0].keys() if rows else []) if k != "_survey_data"]
-    per_survey: dict = {sid: [] for sid in survey_ids}
+    per_survey: dict = {sid: [] for sid in s_ids}
+    users_data = []
 
     import json as _json
     for row in rows:
         surveys_data = row.get("_survey_data") or []
+        user_row = {c: row[c] for c in base_cols if c in row}
+        users_data.append(user_row)
+
+        info_usuario = {
+            'Id': row.get('Id'),
+            'Nombre': row.get('Nombre'),
+            'Apellido': row.get('Apellido'),
+            'Correo Electrónico': row.get('Correo Electrónico'),
+            'Teléfono': row.get('Teléfono')
+        }
+
         for entry in surveys_data:
             sid = entry.get("survey_id")
             if sid not in per_survey:
                 continue
-            user_row = {c: row[c] for c in base_cols if c in row}
-            user_row["Estado Encuesta"] = entry.get("status_name", "-")
-            user_row["Fecha Respuesta"] = entry.get("answered_date", "-")
+            
+            survey_row = info_usuario.copy()
 
-            answers_raw = entry.get("answers_json")
+            answers_raw = entry.get("respuestas")
             if answers_raw:
                 try:
                     answers = _json.loads(answers_raw) if isinstance(answers_raw, str) else answers_raw
@@ -793,36 +1506,57 @@ def generate_internal_report(body: InternalReportRequest, _: dict = Depends(get_
                                 a = v["option"].get("answer", "-")
                             else:
                                 q, a = str(_k), str(v)
-                            user_row[q] = a
+                            q_clean = str(q).replace(',', ' - ')
+                            a_clean = str(a).replace(',', ' - ')
+                            survey_row[q_clean] = a_clean
                 except Exception:
                     pass
-            per_survey[sid].append(user_row)
+            per_survey[sid].append(survey_row)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Full users sheet
-        df_users = pd.DataFrame([{c: row[c] for c in base_cols if c in row} for row in rows])
+        df_users = pd.DataFrame(users_data)
         df_users.to_excel(writer, sheet_name="Usuarios", index=False)
 
-        for sid in survey_ids:
+        surveys_validas_count = 0
+
+        for sid in s_ids:
             data = per_survey[sid]
             if data:
-                sheet_name = _clean_sheet_name(f"{sid} {survey_names.get(sid, '')}")
+                surveys_validas_count += 1
+                survey_name = survey_names.get(sid, "")
+                # Limitamos el nombre a 31 caracteres para prevenir un crash de openpyxl
+                sheet_name = f"Survey_{sid}_{_clean_sheet_name(survey_name)}"[:31]
                 pd.DataFrame(data).to_excel(writer, sheet_name=sheet_name, index=False)
 
         # Summary sheet
-        summary_rows = [
-            {"Survey ID": sid, "Nombre": survey_names.get(sid, "-"),
-             "Usuarios encontrados": len(per_survey[sid]),
-             "StatusId filtrado": body.status_id or "Todos"}
-            for sid in survey_ids
+        surveys_info = [
+            {
+                'Survey ID': sid,
+                'Nombre': survey_names.get(sid, "-"),
+                'Usuarios Únicos': len(set(r['Id'] for r in per_survey[sid])),
+                'Participaciones': len(per_survey[sid]),
+                'StatusId Filtrado': status_id if status_id else 'Todos',
+                'Estado de la Encuesta': status_name
+            }
+            for sid in s_ids if len(per_survey[sid]) > 0
         ]
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Resumen", index=False)
+        if surveys_info:
+            pd.DataFrame(surveys_info).to_excel(writer, sheet_name="Surveys", index=False)
+            
+        resumen_data = {
+            'Métrica': ['Usuarios Únicos', 'Participaciones Totales', 'Surveys Incluidas'],
+            'Valor': [len(users_data), sum(len(per_survey[sid]) for sid in s_ids), surveys_validas_count],
+            'StatusId Filtrado': [status_id if status_id else 'Todos'] * 3,
+            'Estado de la Encuesta': [status_name] * 3
+        }
+        pd.DataFrame(resumen_data).to_excel(writer, sheet_name="Resumen", index=False)
 
     output.seek(0)
     return StreamingResponse(
         iter([output.read()]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=reporte_interno.xlsx"},
     )
 

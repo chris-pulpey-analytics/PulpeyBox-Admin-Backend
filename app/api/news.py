@@ -3,8 +3,9 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import Optional
-from datetime import date
+from datetime import date, datetime
 from pydantic import BaseModel
+from psycopg2.extras import execute_values
 from app.api.auth import get_current_admin
 from app.core.database import get_db
 
@@ -155,12 +156,20 @@ def get_news(news_id: int, _: dict = Depends(get_current_admin)):
             """
             SELECT u."Id", u."Name", u."LastName", u."Email",
                    unp."Status", unp."ClickCount",
-                   unp."FirstClickDate", unp."LastClickDate"
+                   unp."FirstClickDate", unp."LastClickDate",
+                   COALESCE(EXTRACT(YEAR FROM AGE(up."BirthDate"))::TEXT, '-') AS edad,
+                   COALESCE(gender."Name", '-') AS genero,
+                   COALESCE(d."DepartmentName", '-') AS departamento,
+                   COALESCE(c."CityName", '-') AS ciudad
             FROM public."UserNewsAndPromotions" unp
             JOIN public."Users" u ON unp."UserId" = u."Id"
-            WHERE unp."NewsAndPromotionId" = %s
+            LEFT JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+            LEFT JOIN public."Settings" gender ON up."GenderId" = gender."Id"
+            LEFT JOIN public."Cities" c ON up."CityId" = c."Id"
+            LEFT JOIN public."Departments" d ON c."DepartmentId" = d."Id"
+            WHERE unp."NewsAndPromotionId" = %s AND unp."Deleted" IS DISTINCT FROM TRUE
             ORDER BY unp."LastClickDate" DESC NULLS LAST
-            LIMIT 100
+            LIMIT 500
             """,
             (news_id,),
         )
@@ -217,6 +226,93 @@ def delete_news(news_id: int, _: dict = Depends(get_current_admin)):
         cur.execute('UPDATE public."NewsAndPromotions" SET "Deleted"=TRUE WHERE "Id"=%s', (news_id,))
         conn.commit()
     return {"message": "Eliminado"}
+
+
+@router.get("/{news_id}/preview-users")
+def preview_users_for_news(
+    news_id: int,
+    gender_id: Optional[int] = None,
+    income_range_id: Optional[int] = None,
+    profession_id: Optional[int] = None,
+    department_id: Optional[int] = None,
+    age_min: Optional[int] = None,
+    age_max: Optional[int] = None,
+    is_buy_manager_home: Optional[bool] = None,
+    is_pregnant: Optional[bool] = None,
+    is_interested_technology: Optional[bool] = None,
+    is_alcohol_consume: Optional[bool] = None,
+    is_tobacco_consume: Optional[bool] = None,
+    page_size: int = 100,
+    _: dict = Depends(get_current_admin),
+):
+    """Previsualiza qué usuarios recibirían esta noticia según filtros demográficos."""
+    conditions = [
+        'u."Deleted" IS DISTINCT FROM TRUE',
+        'NOT EXISTS (SELECT 1 FROM public."UserNewsAndPromotions" unp WHERE unp."UserId"=u."Id" AND unp."NewsAndPromotionId"=%s)',
+    ]
+    params = [news_id]
+
+    if gender_id:
+        conditions.append('up."GenderId"=%s')
+        params.append(gender_id)
+    if income_range_id:
+        conditions.append('up."IncomeRangeId"=%s')
+        params.append(income_range_id)
+    if profession_id:
+        conditions.append('up."ProfessionsId"=%s')
+        params.append(profession_id)
+    if department_id:
+        conditions.append('d."Id"=%s')
+        params.append(department_id)
+    if age_min is not None:
+        conditions.append('EXTRACT(YEAR FROM AGE(up."BirthDate")) >= %s')
+        params.append(age_min)
+    if age_max is not None:
+        conditions.append('EXTRACT(YEAR FROM AGE(up."BirthDate")) <= %s')
+        params.append(age_max)
+    if is_buy_manager_home is not None:
+        conditions.append('up."IsBuyManagerHome"=%s')
+        params.append(is_buy_manager_home)
+    if is_pregnant is not None:
+        conditions.append('up."IsPregnant"=%s')
+        params.append(is_pregnant)
+    if is_interested_technology is not None:
+        conditions.append('up."IsInterestedTechnology"=%s')
+        params.append(is_interested_technology)
+    if is_alcohol_consume is not None:
+        conditions.append('up."IsAlcoholConsume"=%s')
+        params.append(is_alcohol_consume)
+    if is_tobacco_consume is not None:
+        conditions.append('up."IsTobaccoConsume"=%s')
+        params.append(is_tobacco_consume)
+
+    where = "WHERE " + " AND ".join(conditions)
+
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f'SELECT COUNT(DISTINCT u."Id") FROM public."Users" u '
+            f'JOIN public."UserProfiles" up ON u."Id"=up."UserId" '
+            f'LEFT JOIN public."Cities" c ON up."CityId"=c."Id" '
+            f'LEFT JOIN public."Departments" d ON c."DepartmentId"=d."Id" '
+            f'{where}',
+            params,
+        )
+        total = cur.fetchone()["count"]
+
+        cur.execute(
+            f'SELECT DISTINCT u."Id", COALESCE(u."Name",\'\') ||\' \'|| COALESCE(u."LastName",\'\') AS full_name, '
+            f'u."Email", u."MobilNumber" AS phone '
+            f'FROM public."Users" u '
+            f'JOIN public."UserProfiles" up ON u."Id"=up."UserId" '
+            f'LEFT JOIN public."Cities" c ON up."CityId"=c."Id" '
+            f'LEFT JOIN public."Departments" d ON c."DepartmentId"=d."Id" '
+            f'{where} LIMIT %s',
+            params + [page_size],
+        )
+        sample = [dict(r) for r in cur.fetchall()]
+
+    return {"total": total, "sample": sample}
 
 
 class AssignNewsUsersRequest(BaseModel):
@@ -281,7 +377,10 @@ async def assign_users_excel_news(
     status: int = Form(0),
     _: dict = Depends(get_current_admin),
 ):
-    """Asigna usuarios a la noticia/promoción desde un Excel con columna 'user_id'."""
+    """
+    Asigna usuarios a la noticia/promoción desde un Excel con columna 'user_id'.
+    Usa bulk queries (ANY + execute_values): 3 queries totales en lugar de N×3.
+    """
     contents = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(contents))
@@ -292,27 +391,69 @@ async def assign_users_excel_news(
     if col is None:
         raise HTTPException(400, "El archivo debe tener una columna llamada 'user_id'")
 
-    assigned = 0
-    skipped = 0
-    errors = []
+    # ── 1. Parsear todos los IDs del Excel ──────────────────────────────────
+    errors: list = []
+    candidate_ids: list[int] = []
+    uid_to_row: dict[int, int] = {}
+
+    for i, row in df.iterrows():
+        row_num = int(i) + 2
+        raw = row[col]
+        try:
+            uid = int(raw)
+            candidate_ids.append(uid)
+            uid_to_row.setdefault(uid, row_num)
+        except (ValueError, TypeError):
+            errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
+
+    if not candidate_ids:
+        return {"assigned": 0, "skipped": 0, "errors": errors}
+
     with get_db() as conn:
         cur = conn.cursor()
-        for i, row in df.iterrows():
-            row_num = int(i) + 2
-            raw = row[col]
-            try:
-                uid = int(raw)
-            except (ValueError, TypeError):
-                errors.append({"row": row_num, "user_id": str(raw), "reason": "ID inválido (no es un número)"})
-                continue
-            result = _assign_news_user(cur, uid, news_id, status)
-            if result == "ok":
-                assigned += 1
-            elif result == "skip":
-                skipped += 1
-            else:
-                errors.append({"row": row_num, "user_id": uid, "reason": "Usuario no encontrado"})
+
+        # ── 2. Validar existencia en una sola query ─────────────────────────
+        cur.execute(
+            'SELECT "Id" FROM public."Users" WHERE "Id" = ANY(%s) AND "Deleted" IS DISTINCT FROM TRUE',
+            (candidate_ids,),
+        )
+        valid_ids: set[int] = {r["Id"] for r in cur.fetchall()}
+
+        for uid in set(candidate_ids) - valid_ids:
+            errors.append({
+                "row": uid_to_row.get(uid),
+                "user_id": uid,
+                "reason": "Usuario no encontrado",
+            })
+
+        if not valid_ids:
+            return {"assigned": 0, "skipped": 0, "errors": errors}
+
+        # ── 3. Detectar ya asignados en una sola query ──────────────────────
+        cur.execute(
+            'SELECT "UserId" FROM public."UserNewsAndPromotions" '
+            'WHERE "NewsAndPromotionId"=%s AND "UserId" = ANY(%s)',
+            (news_id, list(valid_ids)),
+        )
+        already_assigned: set[int] = {r["UserId"] for r in cur.fetchall()}
+        skipped = len(already_assigned)
+
+        # ── 4. INSERT masivo en una sola query ──────────────────────────────
+        to_insert = list(valid_ids - already_assigned)
+        assigned = 0
+        if to_insert:
+            now = datetime.utcnow()
+            execute_values(
+                cur,
+                'INSERT INTO public."UserNewsAndPromotions" '
+                '("UserId","NewsAndPromotionId","Status","ClickCount","CreationDate","Deleted") '
+                "VALUES %s",
+                [(uid, news_id, status, 0, now, False) for uid in to_insert],
+            )
+            assigned = len(to_insert)
+
         conn.commit()
+
     return {"assigned": assigned, "skipped": skipped, "errors": errors}
 
 

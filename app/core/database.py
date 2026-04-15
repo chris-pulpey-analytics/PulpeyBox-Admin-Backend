@@ -12,6 +12,7 @@ def get_connection():
         user=settings.DB_USER,
         password=settings.DB_PASSWORD,
         cursor_factory=psycopg2.extras.RealDictCursor,
+        options="-c client_encoding=UTF8",
     )
 
 

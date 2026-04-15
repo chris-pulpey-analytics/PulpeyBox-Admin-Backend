@@ -174,6 +174,64 @@ def get_metrics(
         )
         income_dist = [dict(r) for r in cur.fetchall()]
 
+        # Distribución por número de hijos
+        cur.execute(
+            f"""SELECT COALESCE(s."Name",'Sin dato') AS name, COUNT(*) AS value
+               FROM public."Users" u
+               JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+               LEFT JOIN public."Settings" s ON up."NumberChildrenId" = s."Id"
+               {dist_where}
+               GROUP BY s."Name" ORDER BY value DESC""",
+            dist_params,
+        )
+        children_dist = [dict(r) for r in cur.fetchall()]
+
+        # Distribución por nivel académico
+        cur.execute(
+            f"""SELECT COALESCE(s."Name",'Sin dato') AS name, COUNT(*) AS value
+               FROM public."Users" u
+               JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+               LEFT JOIN public."Settings" s ON up."LevelAcademicId" = s."Id"
+               {dist_where}
+               GROUP BY s."Name" ORDER BY value DESC""",
+            dist_params,
+        )
+        level_academic_dist = [dict(r) for r in cur.fetchall()]
+
+        # Distribución por rol en el hogar
+        cur.execute(
+            f"""SELECT COALESCE(s."Name",'Sin dato') AS name, COUNT(*) AS value
+               FROM public."Users" u
+               JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+               LEFT JOIN public."Settings" s ON up."RoleHouseId" = s."Id"
+               {dist_where}
+               GROUP BY s."Name" ORDER BY value DESC""",
+            dist_params,
+        )
+        role_house_dist = [dict(r) for r in cur.fetchall()]
+
+        # Distribución por frecuencia de actividades físicas
+        cur.execute(
+            f"""SELECT COALESCE(s."Name",'Sin dato') AS name, COUNT(*) AS value
+               FROM public."Users" u
+               JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+               LEFT JOIN public."Settings" s ON up."FrequencyActivitiesPhysicalId" = s."Id"
+               {dist_where}
+               GROUP BY s."Name" ORDER BY value DESC""",
+            dist_params,
+        )
+        frequency_dist = [dict(r) for r in cur.fetchall()]
+
+        # Usuarios con ubicación (lat/lng registrada)
+        cur.execute(
+            """SELECT COUNT(*) FROM public."Users" u
+               JOIN public."UserProfiles" up ON u."Id" = up."UserId"
+               WHERE u."Deleted" IS DISTINCT FROM TRUE
+               AND up."Latitude" IS NOT NULL AND up."Longitude" IS NOT NULL
+               AND up."Latitude" != '' AND up."Longitude" != ''"""
+        )
+        with_location = cur.fetchone()["count"]
+
         # Registros por mes
         reg_date_cond = ""
         reg_params = []
@@ -229,6 +287,7 @@ def get_metrics(
             "new_this_month": new_this_month,
             "active_30d": active_30d,
             "with_profile": with_profile,
+            "with_location": with_location,
             "unverified": unverified,
             "incomplete": incomplete,
             "migrated": migrated,
@@ -241,4 +300,8 @@ def get_metrics(
         "monthly_comparison": comparison,
         "marital_distribution": marital_dist,
         "income_distribution": income_dist,
+        "children_distribution": children_dist,
+        "level_academic_distribution": level_academic_dist,
+        "role_house_distribution": role_house_dist,
+        "frequency_distribution": frequency_dist,
     }
